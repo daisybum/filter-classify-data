@@ -9,32 +9,92 @@ filter_and_copy.py
 """
 
 import argparse
+import json
 import shutil
 from pathlib import Path
 
-# 0-6 label ↔ class folder names
-CLASS_NAMES = [
-    'Hazy',
-    'Normal',
-    'raining',
-    'rainy but not raining',
-    'snowing',
-    'snowy but not snowing',
-    'unclear'
-]
+# Third-party ML & CV
+
+from src.classifier import CLASS_NAMES, classify_folder
+
 
 # ────────────────────────────── Utility Functions ──────────────────────────────
 def has_jpeg(folder: Path) -> bool:
     """Returns True if folder contains at least one .jpg/.jpeg file."""
     return any(p.suffix.lower() in {'.jpg', '.jpeg'} for p in folder.iterdir() if p.is_file())
 
-def classify_folder(folder: Path) -> int:
+
+
+"""
+    Strategy
+    --------
+    1. Lazily load the Swin-Transformer V2 model (checkpoint searched under
+       ``weather_classification/models/*.pth``).
+    2. Run inference on every JPEG in *folder*.
+    3. Average the softmax probabilities across images and return the arg-max
+       class index (0-6).
     """
-    Replace this with your model code.
-    For example, always returns 'unclear'(6).
-    """
-    # e.g., Apply desired logic like majority vote / average softmax after per-image prediction
-    return 6
+
+    global _MODEL  # noqa: PLW0603 – mutation intentional for caching
+
+    # ── Lazy model init ────────────────────────────────────────────────────────
+    if _MODEL is None:
+        ckpt_dir = (Path(__file__).resolve().parent.parent / "weather_classification" / "models")
+        ckpt_path_list = sorted(ckpt_dir.glob("*.pth"))
+        if not ckpt_path_list:
+            raise FileNotFoundError(
+                f"No .pth checkpoint found in {ckpt_dir}. Please place your trained model there.")
+        ckpt_path = ckpt_path_list[0]  # pick the first one
+
+        # Always 7 classes for this project
+        num_classes = len(CLASS_NAMES)
+        device = _DEVICE
+
+        # ----------------------- Checkpoint loading --------------------------
+        ckpt = torch.load(ckpt_path, map_location=device)
+        state_dict = (
+            ckpt.get("model_state_dict")
+            or ckpt.get("state_dict")
+            or ckpt  # assume raw state-dict
+        )
+
+        # ---------------------------- Model ----------------------------------
+        try:
+            model = create_model("swinv2_large", pretrained=False, num_classes=num_classes)
+        except RuntimeError:
+            model = AutoModelForImageClassification.from_pretrained(
+                "microsoft/swinv2-large-patch4-window12to16-192to256-22kto1k-ft",
+                num_labels=num_classes,
+                ignore_mismatched_sizes=True,
+            )
+
+        model.load_state_dict(state_dict, strict=False)
+        model.eval().to(device)
+        _MODEL = model  # cache
+
+    model = _MODEL
+
+    # ── Image preprocessing ───────────────────────────────────────────────────
+    preprocess = _PREPROCESS
+
+    # Iterate over JPEG images in the folder
+    img_paths = [p for p in folder.iterdir() if p.suffix.lower() in {".jpg", ".jpeg"}]
+    if not img_paths:
+        return CLASS_NAMES.index("unclear")  # default fallback
+
+    probs_accum = torch.zeros(len(CLASS_NAMES), device=_DEVICE)
+    for img_path in img_paths:
+        img = Image.open(img_path).convert("RGB")
+        tensor = preprocess(img).unsqueeze(0).to(_DEVICE)
+        with torch.no_grad():
+            output = model(tensor)
+            logits = output.logits if hasattr(output, "logits") else output
+            probs = F.softmax(logits, dim=1)[0]
+            probs_accum += probs
+
+    avg_probs = probs_accum / len(img_paths)
+    predicted_idx = int(avg_probs.argmax().item())
+"""
 
 # ────────────────────────────── Main Logic ──────────────────────────────
 def main(src_root: Path, dst_root: Path, overwrite: bool):
@@ -61,9 +121,14 @@ def main(src_root: Path, dst_root: Path, overwrite: bool):
 # ────────────────────────────── CLI Entry Point ──────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="JPEG-containing folder filtering, classification, and copying script")
-    parser.add_argument("--src", required=True, help="Source root path")
-    parser.add_argument("--dst", required=True, help="Destination root path (contains/creates 7 class folders)")
-    parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing folders")
+    parser.add_argument("--config", default="config.json", help="Path to JSON config file containing src/dst/overwrite")
     args = parser.parse_args()
 
-    main(Path(args.src).expanduser(), Path(args.dst).expanduser(), args.overwrite)
+    with open(args.config, "r", encoding="utf-8") as cf:
+        cfg = json.load(cf)
+
+    main(
+        Path(cfg["src"]).expanduser(),
+        Path(cfg["dst"]).expanduser(),
+        bool(cfg.get("overwrite", False)),
+    )
