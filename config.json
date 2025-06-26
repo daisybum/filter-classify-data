@@ -1,0 +1,5 @@
+{
+  "src": "path/to/source/root",
+  "dst": "path/to/destination/root",
+  "overwrite": false
+}
