@@ -17,6 +17,7 @@ from PIL import Image
 from torchvision import transforms
 from timm import create_model
 from transformers import AutoModelForImageClassification
+from functools import lru_cache
 
 CLASS_NAMES: List[str] = [
     "Hazy",
@@ -38,15 +39,13 @@ _PREPROCESS = transforms.Compose(
     ]
 )
 
-_MODEL: torch.nn.Module | None = None
 
 
+@lru_cache(maxsize=1)
 def _load_model() -> torch.nn.Module:
     """Load Swin V2 classification model checkpoint lazily (singleton)."""
-    global _MODEL  # noqa: PLW0603 – intentional module-level cache
 
-    if _MODEL is not None:
-        return _MODEL
+
 
     # Project root (= two levels up from this file) → weather_classification/models/
     ckpt_dir = Path(__file__).resolve().parents[2] / "weather_classification" / "models"
@@ -77,8 +76,7 @@ def _load_model() -> torch.nn.Module:
 
     model.load_state_dict(state_dict, strict=False)
     model.eval().to(_DEVICE)
-    _MODEL = model
-    return _MODEL
+    return model
 
 
 def classify_folder(folder: Path) -> int:
